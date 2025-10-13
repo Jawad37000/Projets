@@ -1,0 +1,472 @@
+---
+title: "ModèlesPourDiapo"
+format: html
+editor: visual
+---
+
+```{r}
+tab_res <- function(x, estim) {
+  
+  metrics <- metric_set(accuracy, f_meas, recall, precision, spec)
+  
+  auc <- metric_set(roc_auc)
+  
+  rocauc <- x |> collect_predictions() |> 
+    roc_auc(truth = Level, 
+            .pred_High, .pred_Low, .pred_Medium,
+            estimator = "macro_weighted")
+  
+  tab <- x |> collect_predictions() |> 
+    metrics(truth = Level, 
+            estimate = c(.pred_class), 
+            estimator = estim) |> 
+    add_row(rocauc)
+  
+  accuracy_value <- tab |> 
+    filter(.metric == "accuracy") |> 
+    pull(.estimate)
+  
+  error <- tibble(
+    .metric = "error",
+    .estimator = estim,
+    .estimate = 1 - accuracy_value
+  )
+  
+  tab <- bind_rows(tab, error)
+  
+  tab$.estimate <- tab$.estimate |> round(3)
+  
+  tab
+}
+
+
+```
+
+
+```{r}
+library(discrim)
+library(tidyverse)
+library(tidymodels)
+library(naivebayes)
+```
+
+
+```{r}
+split_data <- initial_split(data, prop = 0.75, strata = Level)
+data_train <- training(split_data)
+data_test <- testing(split_data)
+
+data_cv <- vfold_cv(data_train)
+```
+
+```{r}
+rec <- recipe(Level ~ ., data = data_train)|> 
+  step_corr(all_numeric_predictors(), threshold = tune()) |>
+  step_outliers_maha(all_numeric(), -all_outcomes()) |>
+  step_outliers_lookout(all_numeric(),-contains(r"(.outliers)"),-all_outcomes()) |> 
+  step_outliers_remove(contains(r"(.outliers)"),score_dropout = 0.5,aggregation_function = "mean")
+```
+
+```{r}
+thresgrid <- grid_regular(threshold(range = c(0.4,0.5)), levels = 5)
+dropgrid <- grid_regular(dropout(range = c(0,1)), levels = 10)
+
+gridexp <- expand.grid(threshold = thresgrid$threshold,dropout = dropgrid$dropout)
+
+colnames(gridexp) <- c("threshold", "dropout")
+
+data_cv <- vfold_cv(data_train)
+```
+
+
+#qda
+
+
+```{r, fig.height=15,fig.width=10}
+qda_mod <- discrim_quad() |>
+  set_mode("classification") |>
+  set_engine("MASS")
+
+qda_wk <- workflow() |>
+  add_model(qda_mod) |>
+  add_recipe(rec)
+
+qda_tune <- tune_grid(
+  qda_wk,
+  resamples = data_cv,
+  grid = thresgrid,
+  metrics = metric_set(accuracy)
+)
+
+qda_tune |> autoplot()
+
+qdabest <-  tibble(threshold = 0.425)
+
+qda_final_wk <- qda_wk |> finalize_workflow(qdabest)
+
+qda_fit <- qda_final_wk |> last_fit(split_data)
+
+qda_fit |> collect_metrics()
+
+qda_fit |> collect_predictions() |> conf_mat(Level,.pred_class)
+
+qda_fit |> collect_predictions() |> roc_curve(Level, .pred_High,.pred_Low,.pred_Medium) |> autoplot()
+
+qda_fit |> tab_res("macro_weighted")
+```
+
+
+
+```{r}
+rec <- recipe(Level ~ ., data = data_train)|> 
+  step_corr(all_numeric_predictors(), threshold = 0.5) |>
+  step_outliers_maha(all_numeric(), -all_outcomes()) |>
+  step_outliers_lookout(all_numeric(),-contains(r"(.outliers)"),-all_outcomes()) |> 
+  step_outliers_remove(contains(r"(.outliers)"),score_dropout = 0.89,aggregation_function = "mean")
+```
+
+
+
+#lda
+
+
+```{r}
+lda_mod <- discrim_linear() |>
+  set_mode("classification") |>
+  set_engine("MASS")
+
+lda_wk <- workflow() |>
+  add_model(lda_mod) |>
+  add_recipe(rec)
+
+lda_fit <- lda_wk |>  last_fit(split_data)
+
+lda_fit |> collect_metrics()
+lda_fit |> collect_predictions() |> conf_mat(Level,.pred_class)
+
+model_on_train <- lda_wk |> fit(data = data_train)
+
+train_predictions <- predict(model_on_train, new_data = data_train)
+
+train_predictions_with_truth <- train_predictions |> 
+  bind_cols(dplyr::select(data_train, Level))
+
+  metrics <- metric_set(accuracy, f_meas, recall, precision, spec)
+
+train_predictions_with_truth |> 
+  metrics(truth = Level, 
+             estimate = c(.pred_class), 
+             estimator = "macro")
+
+lda_fit |> tab_res("macro")
+
+lda_fit |> collect_predictions() |> roc_curve(Level, .pred_High,.pred_Low,.pred_Medium) |> autoplot()
+
+
+```
+
+
+# KNN
+
+
+```{r}
+knn_mod <- nearest_neighbor() |>
+  set_mode("classification") |>
+  set_engine("kknn") |>
+  set_args(neighbors = tune())
+
+knn_wk <- workflow() |>
+  add_model(knn_mod) |>
+  add_recipe(rec)
+
+kgrid <- grid_regular(neighbors(),levels = 10)
+
+knn_tune <- tune_grid(knn_wk,
+                      grid = kgrid,
+                      resamples = data_cv,
+                      metrics = metric_set(recall)
+                        )
+knnbest <- knn_tune |> select_best(metric = "recall")
+
+knn_fit <- knn_wk |> finalize_workflow(knnbest) |> last_fit(split_data)
+
+knn_fit |> tab_res("macro_weighted")
+
+knn_fit_train <- knn_wk |> finalize_workflow(knnbest) |> fit(data_train)
+
+knn_predict_train <- knn_fit_train |> predict(data_train)
+
+knn_predict_train$Level <- data_train$Level
+
+knn_predict_train |> tab_res_train("macro_weighted")
+```
+
+# Bayes naif
+
+```{r}
+bn_mod <- naive_Bayes() |>
+  set_engine("naivebayes")  |> 
+  set_mode("classification") |> set_args(smoothness = tune(), Laplace = tune())
+
+bn_wk <-  workflow() |> 
+  add_model(bn_mod) |> 
+  add_recipe(rec)
+
+smoothgrid <- grid_regular(smoothness(), levels = 10)
+Laplacegrid <- grid_regular(Laplace(),levels = 10)
+
+bngrid <- expand.grid(smoothness = smoothgrid$smoothness,Laplace = Laplacegrid$Laplace)
+
+bn_tune <- tune_grid(bn_wk,
+                     resamples = data_cv,
+                     grid = bngrid,
+                     metrics = metric_set(recall))
+
+bnbest <- bn_tune |> select_best(metric = "recall")
+
+bn_fit <- bn_wk |> finalize_workflow(bnbest) |> last_fit(split_data)
+
+bn_fit |> tab_res("macro")
+
+bn_fit_train <- bn_wk |> finalize_workflow(bnbest) |> fit(data_train)
+
+bn_predict_train <- bn_fit_train |> predict(data_train)
+
+bn_predict_train$Level <-data_train$Level
+
+bn_predict_train |> tab_res_train("macro")
+
+save(bn_tune,file = "modèle/tune/bn_tune.RData")
+save(bn_fit,file = "modèle/fit/bn_fit.RData")
+```
+
+#SVM
+
+##Svm lin
+
+```{r}
+svml_mod <- svm_linear() |>
+  set_mode("classification") |>
+  set_engine("kernlab")  |> set_args(cost = tune())
+
+svml_wk <- workflow() |>
+  add_model(svml_mod) |>
+  add_recipe(rec)
+
+svmlgrid <- grid_regular(cost(),levels = 20)
+
+svml_tune <- tune_grid(svml_wk,
+                       grid = svmlgrid,
+                       resamples = data_cv,
+                       metrics = metric_set(recall))
+
+svmlbest <- svml_tune |> select_best(metric = "recall")
+
+svml_fit <- svml_wk |> finalize_workflow(svmlbest) |> last_fit(split_data)
+
+svml_fit |> tab_res("macro")
+
+svml_fit_train <- svml_wk |> finalize_workflow(svmlbest) |> fit(data_train)
+
+svml_predict_train <- svml_fit_train |> predict(data_train)
+
+svml_predict_train$Level <-data_train$Level
+
+svml_predict_train |> tab_res_train("macro")
+
+save(svml_tune,file = "modèle/tune/svml_tune.RData")
+save(svml_fit,file = "modèle/fit/svml_fit.RData")
+```
+
+## Svm rad
+
+```{r}
+svmr_mod <- svm_rbf() |>
+  set_mode("classification") |>
+  set_engine("kernlab")  |>
+  set_args(cost = tune(), rbf_sigma = tune())
+
+svmr_wk <- workflow() |>
+  add_model(svmr_mod) |>
+  add_recipe(rec)
+
+costgrid <- grid_regular(cost(),levels = 20)
+sigmgrid <- grid_regular(rbf_sigma(),levels = 10)
+
+svmrgrid <- expand.grid(cost = costgrid$cost, rbf_sigma = sigmgrid$rbf_sigma)
+
+svmr_tune <- tune_grid(svmr_wk,
+                       grid = svmrgrid,
+                       resamples = data_cv,
+                       metrics = metric_set(recall))
+
+svmrbest <- svmr_tune |> select_best(metric = "recall")
+
+svmr_fit <- svmr_wk |> finalize_workflow(svmrbest) |> last_fit(split_data)
+
+svmr_fit |> tab_res("macro")
+
+svmr_fit_train <- svmr_wk |> finalize_workflow(svmrbest) |> fit(data_train)
+
+svmr_predict_train <- svmr_fit_train |> predict(data_train)
+
+svmr_predict_train$Level <-data_train$Level
+
+svmr_predict_train |> tab_res_train("macro")
+
+save(svmr_tune,file = "modèle/tune/svmr_tune.RData")
+save(svmr_fit,file = "modèle/fit/svmr_fit.RData")
+```
+#Decision tree
+
+```{r}
+tree_mod <- decision_tree() |> 
+  set_engine("rpart") |> 
+  set_mode("classification") |> 
+              set_args(cost_complexity = tune())
+
+tree_wk <- workflow() |> 
+  add_model(tree_mod)|>
+  add_recipe(rec)
+
+treegrid <- grid_regular(cost_complexity(), levels = 20)
+
+system.time(
+tree_tune <- tune_grid(
+  tree_wk,
+  resamples = data_cv,
+  grid = treegrid,
+  metrics = metric_set(recall)
+)
+)
+
+treebest <- tree_tune |> select_best(metric = "recall")
+
+tree_fit <- tree_wk |> finalize_workflow(treebest) |> last_fit(split_data)
+
+tree_fit |> tab_res("macro")
+
+tree_fit_train <- tree_wk |> finalize_workflow(treebest) |> fit(data_train)
+
+tree_predict_train <- tree_fit_train |> predict(data_train)
+
+tree_predict_train$Level <-data_train$Level
+
+tree_predict_train |> tab_res_train("macro")
+
+save(tree_tune,file = "modèle/tune/tree_tune.RData")
+save(tree_fit,file = "modèle/fit/tree_fit.RData")
+```
+# RF
+
+```{r}
+rf_mod <- rand_forest() |> 
+  set_engine("randomForest", importance = TRUE) |>
+  set_mode("classification") |> 
+  set_args(mtry = tune(), tree_depth = tune(), min_n = tune())
+
+rf_wk <- workflow() |> 
+  add_model(rf_mod) |> 
+  add_recipe(rec)
+
+mtrygrid <- grid_regular(mtry(range = c(1, 5)), levels = 5)
+treegrid <- grid_regular(tree_depth(), levels = 5)
+minngrid <- grid_regular(min_n(), levels = 5)
+
+gridrf <- expand.grid(mtry = mtrygrid$mtry, tree_depth = treegrid$tree_depth, min_n = minngrid$min_n)
+
+system.time(
+  rf_tune <- tune_grid(
+    rf_wk,
+    resamples = data_cv,
+    grid = gridrf,
+    metrics = metric_set(recall)
+  )
+)
+
+
+rf_tune_tbl <- rf_tune |> collect_metrics()
+
+ggplot(rf_tune_tbl, aes(x = mtry, y = mean, color = as.factor(min_n), group = min_n)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ tree_depth) + 
+  labs(
+    title = "Performance en fonction de mtry et min_n pour chaque tree_depth",
+    x = "mtry",
+    y = "Recall (moyenne)",
+    color = "min_n"
+  ) +
+  theme_minimal()
+
+rfbest <- rf_tune |> select_best(metric = "recall")
+
+rf_fit <- rf_wk |> finalize_workflow(rfbest) |> last_fit(split_data)
+
+rf_fit |> tab_res("macro")
+
+rf_fit_train <- rf_wk |> finalize_workflow(rfbest) |> fit(data_train)
+
+rf_predict_train <- rf_fit_train |> predict(data_train)
+
+rf_predict_train$Level <-data_train$Level
+
+rf_predict_train |> tab_res_train("macro")
+
+save(rf_tune,file = "modèle/tune/rf_tune.RData")
+save(rf_fit,file = "modèle/fit/rf_fit.RData")
+
+```
+# Boosting
+
+```{r}
+boost_mod <- boost_tree()|>
+  set_engine("xgboost") |>
+  set_mode("classification") |> 
+  set_args(  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune())
+
+recb <- recipe(Level ~ ., data = data_train)|> 
+  step_corr(all_numeric_predictors(), threshold = 0.4263158)
+
+boost_wk <- workflow() |>
+  add_model(boost_mod) |>
+  add_recipe(recb)
+
+
+
+
+```
+
+```{r}
+cores <- detectCores() - 1  # Utilise tous les cœurs sauf un (pour ne pas surcharger)
+cl <- makeCluster(cores)
+registerDoParallel(cl)
+
+boost_tune <- tune_grid(
+  boost_wk, 
+  resamples = data_cv, 
+  grid = grid_regular(extract_parameter_set_dials(boost_wk), levels = c(trees = 5, tree_depth = 10, learn_rate = 3)), 
+  metric = metric_set(recall)
+)
+stopCluster(cl)
+
+boostbest <- boost_tune |> select_best(metric = "accuracy")
+
+boost_fit <- boost_wk |> finalize_workflow(boostbest) |> last_fit(split_data)
+
+boost_fit |> tab_res("macro")
+
+boost_fit_train <- boost_wk |> finalize_workflow(boostbest) |> fit(data_train)
+
+boost_predict_train <- boost_fit_train |> predict(data_train)
+
+boost_predict_train$Level <-data_train$Level
+
+boost_predict_train |> tab_res_train("macro")
+
+save(boost_tune,file = "modèle/tune/boost_tune.RData")
+save(boost_fit,file = "modèle/fit/boost_fit.RData")
+```
+

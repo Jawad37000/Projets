@@ -1,0 +1,1115 @@
+---
+title: "Code oral"
+format: html
+---
+
+
+
+# library
+
+
+
+```{r}
+#| message: false
+set.seed(123) # Pour la reproductibilité
+library(skimr)
+library(tidyverse)
+library(tidymodels)
+library(tidy.outliers)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+library(naniar)
+library(FactoMineR)
+library(factoextra)
+library(gt)
+library(vip)
+library(discrim)
+library(naivebayes)
+library(doParallel)
+```
+
+
+
+
+#Fonction
+
+
+
+```{r, include=FALSE}
+
+kablesetconf <- function(x,...) {
+  x |> kable(align = "c",...) |>
+    kable_styling(full_width = F,
+                  bootstrap_options = c(),
+                  position = "center"
+                  )
+}
+
+kableset <- function(x,...) {
+  x |> kable(align = "c",...) |>
+    kable_styling(full_width = F,
+                  bootstrap_options = c("stripped","bordered"),
+                  position = "center"
+                  )
+}
+
+pourcent <- function(x){
+  x*100
+}
+
+tab_res_train <- function(x, estim) {
+  
+  metrics <- metric_set(accuracy, f_meas, recall, precision, spec)
+  
+  
+  tab <- x  |> 
+    metrics(truth = Level, 
+            estimate = c(.pred_class), 
+            estimator = estim)
+  
+  accuracy_value <- tab |> 
+    filter(.metric == "accuracy") |> 
+    pull(.estimate)
+  
+  error <- tibble(
+    .metric = "error",
+    .estimator = estim,
+    .estimate = 1 - accuracy_value
+  )
+  
+  tab <- bind_rows(tab, error)
+  
+  tab$.estimate <- tab$.estimate |> round(3) |> pourcent()
+  
+  tab
+}
+
+
+tab_res <- function(x, estim) {
+  
+  metrics <- metric_set(accuracy, f_meas, recall, precision, spec)
+  
+  auc <- metric_set(roc_auc)
+  
+  rocauc <- x |> collect_predictions() |> 
+    roc_auc(truth = Level, 
+            .pred_High, .pred_Low, .pred_Medium,
+            estimator = "macro_weighted")
+  
+  tab <- x |> collect_predictions() |> 
+    metrics(truth = Level, 
+            estimate = c(.pred_class), 
+            estimator = estim) |> 
+    add_row(rocauc)
+  
+  accuracy_value <- tab |> 
+    filter(.metric == "accuracy") |> 
+    pull(.estimate)
+  
+  error <- tibble(
+    .metric = "error",
+    .estimator = estim,
+    .estimate = 1 - accuracy_value
+  )
+  
+  tab <- bind_rows(tab, error)
+  
+  tab$.estimate <- tab$.estimate |> round(3) |> pourcent()
+  
+  tab
+}
+
+
+matconf <- function(x){
+  conf <- x |> collect_predictions()
+  conftab <- table(conf$.pred_class,conf$Level)
+  conftab_dt <- as.data.frame(conftab)
+  colnames(conftab_dt) <- c("prediction", "truth", "n")
+  conftab_dt$prediction <- factor(conftab_dt$prediction,levels = c("Medium","Low","High"))
+  
+  ggplot(conftab_dt, aes(x = truth, y = prediction, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  geom_text(aes(label = n), color = "black", size = 5) +
+  labs(x = "Vérité",
+       y = "Prédiction",
+       fill = "Nombre d'observations") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.background = element_blank(),
+        plot.background = element_blank())
+}
+
+
+```
+
+
+
+
+# Importation des données
+
+
+
+
+```{r}
+data <- read.table("data/cancer.csv",
+                   header = T,
+                   sep = ",",
+                   stringsAsFactors = T
+                   )[-c(1,2,4)]
+```
+
+
+
+# Etudes statistiques
+
+## Analyse
+
+
+
+```{r}
+datasum <- data |> skim()
+
+datasum[,c(1,2,3,7,15,8,9)] |> kableset() |>  scroll_box(width = "100%", height = "600px") |> column_spec(2, bold = TRUE, background = "black", color = "white")
+```
+
+
+
+
+## Boxplot
+
+
+
+```{r, fig.height=10,fig.width=20}
+dfpivot <- data |>
+  pivot_longer(cols = -Level, names_to = "Variables", values_to = "Valeurs")
+
+dfpivot |>
+  ggplot(aes(x = Level, y = Valeurs)) +
+  geom_boxplot(aes(fill = Level)) +
+  facet_wrap(~ Variables, scales = "free", ncol = 4) + 
+  theme(panel.spacing = unit(1, "lines"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    panel.grid = element_blank(),
+    plot.background = element_rect(fill = "lightgrey"),
+    panel.background = element_rect(fill = "lightyellow"),
+    legend.background = element_rect(fill= "lightgrey") )+
+  ggtitle("Boxplot des variables en fonctions  du niveau de risque")
+```
+
+
+
+## Test d'indépendance{.center}
+
+
+
+
+```{r}
+test_res <- data.frame(Variable = character(), Df = numeric(), Sum_Sq = numeric(), 
+                      Mean_Sq = numeric(), F_value = numeric(), p_value = numeric(), 
+                      stringsAsFactors = FALSE)
+
+for (var in names(data)[-ncol(data)]) {
+  if (is.numeric(data[[var]])) {
+    anova_result <- aov(data[[var]] ~ data[[ncol(data)]], data = data)
+    summary_result <- summary(anova_result)[[1]]
+
+    test_res <- rbind(test_res, data.frame(
+      Variable = var,
+      Df = summary_result[1, "Df"],
+      Sum_Sq = summary_result[1, "Sum Sq"],
+      Mean_Sq = summary_result[1, "Mean Sq"],
+      F_value = summary_result[1, "F value"],
+      p_value = summary_result[1, "Pr(>F)"]
+    ))
+  }
+}
+
+test_res
+
+```
+
+
+
+
+## Corrplot
+
+
+
+```{r,fig.height=10,fig.width=20}
+corrplot::corrplot(cor(data[,-23]), 
+                   method = "color",
+                   tl.cex =1.5, tl.srt = 45,
+                   col = colorRampPalette(c("blue", "white", "red"))(200),
+                   type = "upper",
+                   diag = FALSE,
+                   tl.col = "black")
+```
+
+
+
+## Valeurs manquantes
+
+
+
+```{r}
+gg_miss_var_cumsum(data)
+```
+
+
+
+
+
+## Equilibre de la classe à prédire{
+
+
+
+```{r}
+table(data$Level) |> t() |> kablesetconf() |>
+  row_spec(0, font_size = 14, extra_css = "border: 0px;")|>
+  row_spec(1, font_size = 40, extra_css = "background-color: lightblue;
+           border-radius: 10px; color: black;")
+```
+
+
+
+
+# ACP
+
+
+
+```{r}
+resACP <- PCA(data, quali.sup = "Level",graph = FALSE)
+```
+
+
+
+## Graphique des Variables
+
+
+
+```{r, fig.height=10,fig.width=20}
+fviz_pca_var(resACP, 
+             col.var = "steelblue", 
+             col.quali.sup = "red",
+             repel = TRUE, 
+             labelsize = 6,axes = 1:2) +
+  theme(text = element_text(size = 14)) + ggtitle("")
+```
+
+
+
+## Graphiques des individus
+
+
+
+```{r}
+fviz_pca_ind(resACP, labelsize = 0, habillage = "Level") + theme(panel.grid = element_blank()) + ggtitle("")
+```
+
+
+
+
+# Creations des modèles
+
+## Séparation des données + validation croisée
+
+
+
+```{r}
+split_data <- initial_split(data, prop = 0.75, strata = Level)
+data_train <- training(split_data)
+
+data_cv <- vfold_cv(data_train)
+```
+
+
+
+## recette + pré-traitement
+
+
+
+```{r}
+rec <- recipe(Level ~ ., data = data_train)|> 
+  step_corr(all_numeric_predictors(), threshold = tune()) |>
+  step_outliers_maha(all_numeric(), -all_outcomes()) |>
+  step_outliers_lookout(all_numeric(),-contains(r"(.outliers)"),-all_outcomes()) |> 
+  step_outliers_remove(contains(r"(.outliers)"),score_dropout = tune("dropout"),aggregation_function = "mean")
+```
+
+
+
+#QDA
+
+## Modèles + grilles
+
+
+
+```{r}
+qda_mod <- discrim_quad() |>
+  set_mode("classification") |>
+  set_engine("MASS")
+
+qda_wk <- workflow() |>
+  add_model(qda_mod) |>
+  add_recipe(rec)
+
+thresgrid <- grid_regular(threshold(range = c(0,1)), levels = 5)
+dropgrid <- grid_regular(dropout(range = c(0,1)), levels = 10)
+
+gridexp <- expand.grid(threshold = thresgrid$threshold,dropout = dropgrid$dropout)
+
+
+```
+
+
+
+## Tunage
+
+
+
+```{r}
+qda_tune1 <- tune_grid(
+  qda_wk,
+  resamples = data_cv,
+  grid = gridexp,
+  metrics = metric_set(recall)
+)
+
+# → A | error: un groupe est trop petit pour 'qda'
+# → B | error: groupe "High" n'est pas de rang plein
+# There were issues with some computations A: x62 B: x245
+
+### La matrice de la classe "High" est trop singulière, donc non inversible ###
+
+
+qda_tune1 |> autoplot()
+
+qda_tune1 |> show_best()
+
+
+save(qda_tune1,file = "modèle/tune/qda_tune1.RData")
+
+```
+
+
+
+
+## Nouvelle grille
+
+
+
+```{r}
+qda_mod <- discrim_quad() |>
+  set_mode("classification") |>
+  set_engine("MASS")
+
+qda_wk <- workflow() |>
+  add_model(qda_mod) |>
+  add_recipe(rec)
+
+thresgrid <- grid_regular(threshold(range = c(0.30,0.42)), levels = 10)
+dropgrid <- grid_regular(dropout(range = c(0,1)), levels = 5)
+
+gridexp <- expand.grid(threshold = thresgrid$threshold,dropout = dropgrid$dropout)
+
+```
+
+
+
+
+## Tunage + dropout fixé
+
+
+
+
+```{r}
+qda_tune2 <- tune_grid(
+  qda_wk,
+  resamples = data_cv,
+  grid = gridexp,
+  metrics = metric_set(recall)
+)
+
+
+qda_tune2 |> autoplot()
+
+
+save(qda_tune2,file = "modèle/tune/qda_tune2.RData")
+
+qda_tune2 |> show_best()
+
+### On choisit ici un seuil de 0.42 et un taux de dropout de 0.75 pour tous les modèles ###
+```
+
+
+
+
+## Finalisation du modèle
+
+
+
+```{r}
+qdabest <- tibble(threshold = 0.42, dropout = 0.75)
+
+qda_final_wk <- qda_wk |> finalize_workflow(qdabest)
+
+qda_fit <- qda_final_wk |> last_fit(split_data)
+save(qda_fit, file = "modèle/fit/qda_fit.RData")
+
+
+```
+
+
+
+
+## Résultat du modèle sur les données test
+
+
+
+```{r}
+qda_fit |> tab_res("macro")
+
+qda_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+
+qda_fit |> matconf()
+```
+
+
+## recette pour tout les modèles
+
+
+
+```{r}
+rec <- recipe(Level ~ ., data = data_train)|> 
+  step_corr(all_numeric_predictors(), threshold = 0.42) |>
+  step_outliers_maha(all_numeric(), -all_outcomes()) |>
+  step_outliers_lookout(all_numeric(),-contains(r"(.outliers)"),-all_outcomes()) |> 
+  step_outliers_remove(contains(r"(.outliers)"),score_dropout = 0.75,aggregation_function = "mean")
+```
+
+
+
+# LDA
+
+## modèle
+
+
+
+```{r}
+lda_mod <- discrim_linear() |>
+  set_mode("classification") |>
+  set_engine("MASS")
+
+lda_wk <- workflow() |>
+  add_model(lda_mod) |>
+  add_recipe(rec)
+
+lda_fit <- lda_wk |>  last_fit(split_data)
+
+save(lda_fit,file = "modèle/fit/lda_fit.RData")
+
+```
+
+
+
+## Résultat + courbe ROC + conf mat
+
+
+
+```{r}
+lda_fit |> tab_res("macro")
+lda_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+lda_fit |> matconf()
+
+```
+
+
+
+# KNN
+
+## modèle + grille
+
+
+
+```{r}
+knn_mod <- nearest_neighbor() |>
+  set_mode("classification") |>
+  set_engine("kknn") |>
+  set_args(neighbors = tune())
+
+knn_wk <- workflow() |>
+  add_model(knn_mod) |>
+  add_recipe(rec)
+
+kgrid <- grid_regular(neighbors(),levels = 20)
+```
+
+
+
+
+## Tunage + finalisation
+
+
+
+```{r}
+knn_tune <- tune_grid(knn_wk,
+                      grid = kgrid,
+                      resamples = data_cv,
+                      metrics = metric_set(recall)
+                        )
+knnbest <- knn_tune |> select_best(metric = "recall")
+
+knn_fit <- knn_wk |> finalize_workflow(knnbest) |> last_fit(split_data)
+
+save(knn_tune,file = "modèle/tune/knn_tune.RData")
+save(knn_fit,file = "modèle/fit/knn_fit.RData")
+```
+
+
+
+## Hyperparamètres
+
+
+
+```{r}
+knn_tune |> autoplot()
+```
+
+
+
+## Résultat
+
+
+
+```{r}
+knn_fit |> tab_res("macro")
+knn_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+knn_fit |> matconf()
+```
+
+
+
+
+# Naive Bayes
+
+## modèle + grille
+
+
+
+```{r}
+bn_mod <- naive_Bayes() |>
+  set_engine("naivebayes")  |> 
+  set_mode("classification") |> set_args(smoothness = tune())
+
+bn_wk <-  workflow() |> 
+  add_model(bn_mod) |> 
+  add_recipe(rec)
+
+smoothgrid <- grid_regular(smoothness(range = c(1,3)), levels = 20)
+
+```
+
+
+
+
+## Tunage + finalisation
+
+
+
+```{r}
+bn_tune <- tune_grid(bn_wk,
+                     resamples = data_cv,
+                     grid = smoothgrid,
+                     metrics = metric_set(recall))
+
+bnbest <- bn_tune |> select_best(metric = "recall")
+
+bn_fit <- bn_wk |> finalize_workflow(bnbest) |> last_fit(split_data)
+
+save(bn_tune,file = "modèle/tune/bn_tune.RData")
+save(bn_fit,file = "modèle/fit/bn_fit.RData")
+```
+
+
+
+## Hyperparamètres
+
+
+
+```{r}
+bn_tune |> autoplot()
+```
+
+
+
+## Résultat
+
+
+```{r}
+bn_fit |> tab_res("macro")
+bn_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+bn_fit |> matconf()
+```
+
+
+
+# SVM
+
+## lin
+
+### modèle + grille
+
+
+
+```{r}
+svml_mod <- svm_linear() |>
+  set_mode("classification") |>
+  set_engine("kernlab")  |> set_args(cost = tune())
+
+svml_wk <- workflow() |>
+  add_model(svml_mod) |>
+  add_recipe(rec)
+
+svmlgrid <- grid_regular(cost(range = c(0,6)),levels = 10)
+```
+
+
+
+
+### Tunage + finalisation
+
+
+
+```{r}
+svml_tune <- tune_grid(svml_wk,
+                       grid = svmlgrid,
+                       resamples = data_cv,
+                       metrics = metric_set(recall))
+
+svmlbest <- svml_tune |> select_best(metric = "recall")
+
+svml_fit <- svml_wk |> finalize_workflow(svmlbest) |> last_fit(split_data)
+
+save(svml_tune,file = "modèle/tune/svml_tune.RData")
+save(svml_fit,file = "modèle/fit/svml_fit.RData")
+```
+
+
+
+### Hyperparamètres
+
+
+
+```{r}
+svml_tune |> autoplot()
+```
+
+
+
+## Résultat
+
+
+```{r}
+svml_fit |> tab_res("macro")
+svml_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+svml_fit |> matconf()
+```
+
+
+
+
+## Rad
+
+### modèle + grille
+
+
+
+```{r}
+svmr_mod <- svm_rbf() |>
+  set_mode("classification") |>
+  set_engine("kernlab")  |>
+  set_args(cost = tune(), rbf_sigma = tune())
+
+svmr_wk <- workflow() |>
+  add_model(svmr_mod) |>
+  add_recipe(rec)
+
+costgrid <- grid_regular(cost(),levels = 20)
+sigmgrid <- grid_regular(rbf_sigma(),levels = 10)
+
+svmrgrid <- expand.grid(cost = costgrid$cost, rbf_sigma = sigmgrid$rbf_sigma)
+```
+
+
+
+
+### Tunage + finalisation
+
+
+
+```{r}
+svmr_tune <- tune_grid(svmr_wk,
+                       grid = svmrgrid,
+                       resamples = data_cv,
+                       metrics = metric_set(recall))
+
+svmrbest <- svmr_tune |> select_best(metric = "recall")
+
+svmr_fit <- svmr_wk |> finalize_workflow(svmrbest) |> last_fit(split_data)
+
+save(svmr_tune,file = "modèle/tune/svmr_tune.RData")
+save(svmr_fit,file = "modèle/fit/svmr_fit.RData")
+```
+
+
+
+### Hyperparamètres
+
+
+
+```{r}
+svmr_tune |> autoplot()
+```
+
+
+
+## Résultat
+
+
+```{r}
+svmr_fit |> tab_res("macro")
+svmr_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+svmr_fit |> matconf()
+```
+
+
+# Arbre
+
+## modèle + grille
+
+
+
+```{r}
+tree_mod <- decision_tree() |> 
+  set_engine("rpart") |> 
+  set_mode("classification") |> 
+  set_args(cost_complexity = tune(), tree_depth = tune())
+
+tree_wk <- workflow() |> 
+  add_model(tree_mod)|>
+  add_recipe(rec)
+
+costgrid <- grid_regular(cost_complexity(range = c(-5, -0.1)), levels = 10)
+treedgrid <- grid_regular(tree_depth(range = c(1,30)), levels = 10)
+
+treegrid <- expand.grid(cost_complexity = costgrid$cost_complexity, tree_depth = treedgrid$tree_depth)
+```
+
+
+
+
+## Tunage + finalisation
+
+
+
+```{r}
+system.time(
+tree_tune <- tune_grid(
+  tree_wk,
+  resamples = data_cv,
+  grid = treegrid,
+  metrics = metric_set(recall)
+)
+)
+
+treebest <- tree_tune |> select_best(metric = "recall")
+
+tree_fit <- tree_wk |> finalize_workflow(treebest) |> last_fit(split_data)
+
+save(tree_tune,file = "modèle/tune/tree_tune.RData")
+save(tree_fit,file = "modèle/fit/tree_fit.RData")
+```
+
+
+
+## Hyperparamètres
+
+
+
+```{r}
+tree_tune |> autoplot()
+```
+
+
+
+## Résultat
+
+
+
+```{r}
+tree_fit |> tab_res("macro")
+tree_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+tree_fit |> matconf()
+```
+
+
+
+## Visualisation de l'arbre
+
+
+
+```{r}
+tree_fit |> 
+  extract_fit_engine() |> 
+  rpart.plot::prp(type = 0, extra = 1, split.box.col = "lightblue",
+                  roundint = FALSE)
+```
+
+
+
+## Importance des variables
+
+
+
+```{r}
+final_model <-  tree_fit |> extract_workflow() |> fit(data)
+
+varimportance <- final_model |> pull_workflow_fit()
+
+vardf <- data.frame(
+  Variable = names(varimportance$fit$variable.importance),
+  Importance = varimportance$fit$variable.importance
+)
+
+
+ggplot(vardf, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "lightblue") +
+  coord_flip() +
+  labs(title = "Importance des Variables", x = "Variables", y = "Importance") +
+  theme_minimal()
+```
+
+
+# Random forest
+
+## modèle + grille
+
+
+
+```{r}
+rf_mod <- rand_forest() |> 
+  set_engine("randomForest", importance = TRUE) |>
+  set_mode("classification") |> 
+  set_args(mtry = tune(), tree_depth = tune(), min_n = tune())
+
+rf_wk <- workflow() |> 
+  add_model(rf_mod) |> 
+  add_recipe(rec)
+
+mtrygrid <- grid_regular(mtry(range = c(1, 5)), levels = 5)
+treegrid <- grid_regular(tree_depth(), levels = 5)
+minngrid <- grid_regular(min_n(), levels = 5)
+
+gridrf <- expand.grid(mtry = mtrygrid$mtry, tree_depth = treegrid$tree_depth, min_n = minngrid$min_n)
+
+```
+
+
+
+
+## Tunage + finalisation
+
+
+
+```{r}
+system.time(
+  rf_tune <- tune_grid(
+    rf_wk,
+    resamples = data_cv,
+    grid = gridrf,
+    metrics = metric_set(recall)
+  )
+)
+
+rfbest <- rf_tune |> select_best(metric = "recall")
+
+rf_fit <- rf_wk |> finalize_workflow(rfbest) |> last_fit(split_data)
+
+save(rf_tune,file = "modèle/tune/rf_tune.RData")
+save(rf_fit,file = "modèle/fit/rf_fit.RData")
+```
+
+
+
+## Hyperparamètres
+
+
+
+```{r}
+rf_tune_tbl <- rf_tune |> collect_metrics()
+
+ggplot(rf_tune_tbl, aes(x = mtry, y = mean, color = as.factor(min_n), group = min_n)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ tree_depth) + 
+  labs(
+    title = "Performance en fonction de mtry et min_n pour chaque tree_depth",
+    x = "mtry",
+    y = "Recall (moyenne)",
+    color = "min_n"
+  ) +
+  theme_minimal()
+```
+
+
+
+## Résultat
+
+
+
+```{r}
+rf_fit |> tab_res("macro")
+rf_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+rf_fit |> matconf()
+```
+
+
+
+
+## Importance des variables
+
+
+
+```{r}
+final_model <-  tree_fit |> extract_workflow() |> fit(data)
+
+varimportance <- final_model |> pull_workflow_fit()
+
+vardf <- data.frame(
+  Variable = names(varimportance$fit$variable.importance),
+  Importance = varimportance$fit$variable.importance
+)
+
+
+ggplot(vardf, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "lightblue") +
+  coord_flip() +
+  labs(title = "Importance des Variables", x = "Variables", y = "Importance") +
+  theme_minimal()
+```
+
+
+
+
+
+# Boosting
+
+## modèle + grille
+
+
+
+```{r}
+boost_mod <- boost_tree()|>
+  set_engine("xgboost") |>
+  set_mode("classification") |> 
+  set_args(  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune())
+
+recb <- recipe(Level ~ ., data = data_train)|> 
+  step_corr(all_numeric_predictors(), threshold = 0.42)
+
+boost_wk <- workflow() |>
+  add_model(boost_mod) |>
+  add_recipe(recb)
+
+```
+
+
+
+
+## Tunage + finalisation
+
+
+
+```{r}
+cores <- detectCores() - 1  
+cl <- makeCluster(cores)
+registerDoParallel(cl)
+
+boost_tune <- tune_grid(
+  boost_wk, 
+  resamples = data_cv, 
+  grid = grid_regular(extract_parameter_set_dials(boost_wk), levels = c(trees = 5, tree_depth = 10, learn_rate = 3)), 
+  metric = metric_set(recall)
+)
+stopCluster(cl)
+
+boostbest <- boost_tune |> select_best(metric = "accuracy")
+
+boost_fit <- boost_wk |> finalize_workflow(boostbest) |> last_fit(split_data)
+
+save(boost_tune,file = "modèle/tune/boost_tune.RData")
+save(boost_fit,file = "modèle/fit/boost_fit.RData")
+```
+
+
+
+## Hyperparamètres
+
+
+
+```{r}
+boost_tune |> autoplot()
+```
+
+
+
+## Résultat
+
+
+
+```{r}
+boost_fit |> tab_res("macro")
+boost_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+boost_fit |> matconf()
+```
+
+
+
+
+# Meilleur modèle
+
+
+
+```{r}
+model_res <- bind_rows(
+  bn_fit   |> tab_res("macro_weighted") |> mutate(model = "Naïve Bayes"),
+  boost_fit |> tab_res("macro_weighted") |> mutate(model = "Boosting"),
+  knn_fit  |> tab_res("macro_weighted") |> mutate(model = "KNN"),
+  lda_fit  |> tab_res("macro_weighted") |> mutate(model = "LDA"),
+  qda_fit  |> tab_res("macro_weighted") |> mutate(model = "QDA"),
+  rf_fit   |> tab_res("macro_weighted") |> mutate(model = "Random Forest"),
+  svml_fit |> tab_res("macro_weighted") |> mutate(model = "SVM Linéaire"),
+  svmr_fit |> tab_res("macro_weighted") |> mutate(model = "SVM RBF"),
+  tree_fit |> tab_res("macro_weighted") |> mutate(model = "Arbre de Décision")
+)
+
+ggplot(model_res |> filter(.metric %in% c("precision","recall", "roc_auc")), 
+       aes(x = fct_reorder(model, .estimate), y = .estimate, fill = .metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Comparaison des modèles",
+       x = "Modèle",
+       y = "Score de performance",
+       fill = "Métrique") +
+  theme_minimal() +
+  coord_flip()
+```

@@ -1,0 +1,1003 @@
+---
+title: "Cancer du poumon"
+format: 
+  revealjs:
+    theme: "serif"
+    center: true
+    transition: "slide"
+    embed-resources: true
+css: "css/styles.css"
+
+---
+
+```{r, include=FALSE,message=FALSE}
+library(skimr)
+library(DT)
+library(tidyverse)
+library(tidymodels)
+library(tidy.outliers)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+library(naniar)
+library(FactoMineR)
+library(factoextra)
+library(vip)
+set.seed(123)
+```
+
+```{r, include=FALSE}
+kablesetconf <- function(x,...) {
+  x |> kable(align = "c",...) |>
+    kable_styling(full_width = F,
+                  bootstrap_options = c(),
+                  position = "center"
+                  )
+}
+
+kableset <- function(x,...) {
+  x |> kable(align = "c",...) |>
+    kable_styling(full_width = F,
+                  bootstrap_options = c("stripped","bordered"),
+                  position = "center"
+                  )
+}
+
+pourcent <- function(x){
+  x*100
+}
+
+tab_res_train <- function(x, estim) {
+  
+  metrics <- metric_set(accuracy, f_meas, recall, precision, spec)
+  
+  
+  tab <- x  |> 
+    metrics(truth = Level, 
+            estimate = c(.pred_class), 
+            estimator = estim)
+  
+  accuracy_value <- tab |> 
+    filter(.metric == "accuracy") |> 
+    pull(.estimate)
+  
+  error <- tibble(
+    .metric = "error",
+    .estimator = estim,
+    .estimate = 1 - accuracy_value
+  )
+  
+  tab <- bind_rows(tab, error)
+  
+  tab$.estimate <- tab$.estimate |> round(3) |> pourcent()
+  
+  tab
+}
+
+
+tab_res <- function(x, estim) {
+  
+  metrics <- metric_set(accuracy, f_meas, recall, precision, spec)
+  
+  auc <- metric_set(roc_auc)
+  
+  rocauc <- x |> collect_predictions() |> 
+    roc_auc(truth = Level, 
+            .pred_High, .pred_Low, .pred_Medium,
+            estimator = "macro")
+  
+  tab <- x |> collect_predictions() |> 
+    metrics(truth = Level, 
+            estimate = c(.pred_class), 
+            estimator = estim) |> 
+    add_row(rocauc)
+  
+  accuracy_value <- tab |> 
+    filter(.metric == "accuracy") |> 
+    pull(.estimate)
+  
+  error <- tibble(
+    .metric = "error",
+    .estimator = estim,
+    .estimate = 1 - accuracy_value
+  )
+  
+  tab <- bind_rows(tab, error)
+  
+  tab$.estimate <- tab$.estimate |> round(3) |> pourcent()
+  
+  tab
+}
+
+
+matconf <- function(x){
+  conf <- x |> collect_predictions()
+  conftab <- table(conf$.pred_class,conf$Level)
+  conftab_dt <- as.data.frame(conftab)
+  colnames(conftab_dt) <- c("prediction", "truth", "n")
+  conftab_dt$prediction <- factor(conftab_dt$prediction,levels = c("Medium","Low","High"))
+  
+  ggplot(conftab_dt, aes(x = truth, y = prediction, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "darkgreen") +
+  geom_text(aes(label = n), color = "black", size = 5) +
+  labs(x = "Vérité",
+       y = "Prédiction",
+       fill = "Nombre d'observations") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.background = element_blank(),
+        plot.background = element_blank())
+}
+```
+
+```{r}
+data <- read.table("data/cancer.csv",
+                   header = T,
+                   sep = ",",
+                   stringsAsFactors = T
+                   )[-c(1,2,4)]
+
+
+split_data <- initial_split(data, prop = 0.75, strata = Level)
+data_train <- training(split_data)
+```
+
+
+
+## Introduction{.center}
+
+:::{.columns}
+
+::: {.column width="60%"}
+Le cancer du poumon, c'est quoi?
+:::
+
+::: {.column width="40%"}
+<img src="img/intro_img.webp"></img>
+:::
+:::
+
+
+## Chances de guérison
+
+- **Stade I-II** : Taux de survie à 5 ans : **50-80 %**
+- **Stade III** : Taux de survie à 5 ans : **20-40 %**
+- **Stade IV** : Moins de **10 %**, mais traitements prolongent la vie
+
+## Problématique
+
+Pouvons-nous prédire le risque pour une personne d'avoir un cancer du poumon à l'aide de ses métriques médicales et comportementales ?
+
+## Méthodes
+
+- Analyse statistique
+- Classification supervisée
+  - Qda/Lda
+  - K-NN
+  - Naive Bayes
+  - SVM
+  - Decision tree/Random forest/Boosting
+  
+# Présentation des données{.smaller}
+
+## Importation des données{.center}
+
+- **Jeu de données** : Artificiel, récupéré sur Kaggle, traitant du risque de cancer du poumon.
+
+- **Caractéristiques** :
+  - 1000 individus, 23 variables.
+  - 1 variable qualitative (niveau de risque : High, Medium, Low).
+  - 23 variables quantitatives discrètes (métriques médicales et comportementales, codées de manière croissante).
+  
+- **Objectif** : Tester plusieurs modèles de classification et en choisir le meilleur parmi eux.
+
+
+## Le jeu de donnée{.smaller}
+
+```{r}
+
+datasum <- data |> skim()
+
+datasum[,c(1,2,8,9)] |> kableset() |>  scroll_box(width = "100%", height = "600px") |> column_spec(2, bold = TRUE, background = "black", color = "white")
+
+```
+
+# Etude statistique
+
+## Boxplot des variables en fonction du niveau de risque{.center}
+
+```{r, fig.height=10,fig.width=20}
+dfpivot <- data |>
+  pivot_longer(cols = -Level, names_to = "Variables", values_to = "Valeurs")
+
+dfpivot |>
+  ggplot(aes(x = Level, y = Valeurs)) +
+  geom_boxplot(aes(fill = Level)) +
+  facet_wrap(~ Variables, scales = "free", ncol = 4) + 
+  theme(panel.spacing = unit(1, "lines"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    panel.grid = element_blank(),
+    plot.background = element_rect(fill = "lightgrey"),
+    panel.background = element_rect(fill = "lightyellow"),
+    legend.background = element_rect(fill= "lightgrey") )
+```
+
+---
+ 
+ => Solution : Supprimer ces valeurs extrêmes afin d'obtenir un modèle plus robuste et généralisable.
+
+
+## Test ANOVA{.smaller}
+
+
+Hypothèse nulle (H₀) \begin{equation}H_0: \mu_1 = \mu_2 = \dots = \mu_k\end{equation}
+
+Hypothèse alternative (H₁) \begin{equation}H_1: \exists i, j \quad \text{tel que} \quad \mu_i \neq \mu_j\end{equation}
+
+Règle de décision : 
+Si \( \text{p-value} < \alpha = 0.05 \), on rejette l'hypothèse nulle \(H_0\) et on conclut que la variable apporte de l'information significative pour séparer les classes.
+
+## Résultats du test{.smaller}
+
+```{r}
+results <- data.frame(Variable = character(), Df = numeric(), F_value = numeric(), p_value = numeric(), 
+                      stringsAsFactors = FALSE)
+
+for (var in names(data)[-ncol(data)]) {
+  if (is.numeric(data[[var]])) {
+    anova_result <- aov(data[[var]] ~ data[[ncol(data)]], data = data)
+    summary_result <- summary(anova_result)[[1]]
+
+    results <- rbind(results, data.frame(
+      Variable = var,
+      Df = summary_result[1, "Df"],
+      F_value = summary_result[1, "F value"],
+      p_value = summary_result[1, "Pr(>F)"]
+    ))
+  }
+}
+
+results |> 
+  datatable(
+    options = list(
+      pageLength = 5,
+      scrollX = TRUE,
+      dom = 'Bfrtip'
+    )
+  ) |> 
+  formatStyle('Variable', fontWeight = 'bold') |> 
+  formatStyle('p_value', 
+              backgroundColor = styleInterval(0.05, c('lightcoral', 'lightgreen')),
+              fontWeight = styleInterval(0.05, c('bold', 'normal')))
+
+```
+
+## Matrice de corrélation des variables{.center}
+
+```{r,fig.height=10,fig.width=20}
+corrplot::corrplot(cor(data[,-23]), 
+                   method = "color",
+                   tl.cex =1.5, tl.srt = 45,
+                   col = colorRampPalette(c("blue", "white", "red"))(200),
+                   type = "upper",
+                   diag = FALSE,
+                   tl.col = "black")
+```
+
+---
+
+=> Solution 2 : Supprimer la dimensionnalité à l'aide d'une ACP et créer un seuil de suppression (threshold) pour ne conserver que les variables corrélées en dessous de ce seuil.
+
+## Valeurs manquantes{.center}
+
+```{r}
+gg_miss_var_cumsum(data)
+```
+
+## Equilibre de la classe à prédire{.center}
+
+```{r}
+table(data$Level) |> t() |> kablesetconf() |>
+  row_spec(0, font_size = 14, extra_css = "border: 0px;")|>
+  row_spec(1, font_size = 40, extra_css = "background-color: lightblue;
+           border-radius: 10px; color: black;")
+```
+
+
+# ACP
+
+```{r}
+resACP <- PCA(data, quali.sup = "Level",graph = FALSE)
+```
+
+
+## Graphique des variables{.center}
+
+```{r, fig.height=10,fig.width=20}
+fviz_pca_var(resACP, 
+             col.var = "steelblue", 
+             col.quali.sup = "red",
+             repel = TRUE, 
+             labelsize = 6,axes = 1:2) +
+  theme(text = element_text(size = 14)) + ggtitle("")
+```
+
+## Graphiques des individus{.center}
+
+```{r}
+fviz_pca_ind(resACP, labelsize = 0, habillage = "Level") + theme(panel.grid = element_blank()) + ggtitle("")
+```
+
+
+# Creation des modèles
+
+## Les metriques à privilégier{.center}
+
+
+
+Sensibilité (Recall) : \begin{equation}
+\text{Rappel} = \frac{VP}{VP + FN}
+\end{equation}
+Précision (Precision) : \begin{equation}
+\text{Précision} = \frac{VP}{VP + FP}
+\end{equation}
+
+
+---
+
+F1 Score : \begin{equation}
+F_1 = 2 \times \frac{\text{Précision} \times \text{Rappel}}{\text{Précision} + \text{Rappel}}
+\end{equation}
+
+
+- Courbe ROC & AUC
+- Matrice de Confusion
+
+## Prétraitement
+
+```{r}
+#| eval: false
+#| echo: true
+
+split_data <- initial_split(data, prop = 0.75, strata = Level)
+data_train <- training(split_data)
+
+data_cv <- vfold_cv(data_train)
+
+rec <- recipe(Level ~ ., data = data_train)|> 
+  step_corr(all_numeric_predictors(), threshold = tune()) |>
+  step_outliers_maha(all_numeric(), -all_outcomes()) |>
+  step_outliers_lookout(all_numeric(),-contains(r"(.outliers)"),-all_outcomes()) |> 
+  step_outliers_remove(contains(r"(.outliers)"),score_dropout = tune("dropout"),aggregation_function = "mean")
+```
+
+
+## Modalités d'études des métriques
+
+- **Étude des courbes ROC de chaque classe (One-vs-All)**
+
+- **Étude des métriques en macro (moyennes)**
+
+# QDA
+
+## Optimisation des hyperparamètres{.center}
+
+
+::: {.column width="50%"}
+
+```{r,fig.height= 10, fig.width=10}
+load("modèle/tune/qda_tune1.RData")
+load("modèle/tune/qda_tune2.RData")
+
+qda_tune1 |> autoplot() + theme(panel.spacing = unit(1, "lines"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16))
+```
+
+:::
+
+::: {.column width="50%"}
+
+```{r,fig.height= 10, fig.width=10}
+qda_tune2 |> autoplot() + theme(panel.spacing = unit(1, "lines"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16))
+```
+
+:::
+
+
+## Optimisation des hyperparamètres{.smaller}
+```{r}
+load("modèle/tune/qda_tune1.RData")
+load("modèle/tune/qda_tune2.RData")
+load("modèle/fit/qda_fit.RData")
+tabmetqda <- qda_tune2 |> show_best(metric = "recall")
+
+tabmetqda[,1:7]  |> kableset()  |> add_header_above(c("Meilleurs paramêtres"=7))
+```
+
+
+## Recette gardée{.smaller}
+
+```{r}
+#| eval: false
+#| echo: true
+rec <- recipe(Level ~ ., data = data_train)|> 
+  step_corr(all_numeric_predictors(), threshold = 0.42) |>
+  step_outliers_maha(all_numeric(), -all_outcomes()) |>
+  step_outliers_lookout(all_numeric(),-contains(r"(.outliers)"),-all_outcomes()) |> 
+  step_outliers_remove(contains(r"(.outliers)"),score_dropout = 0.75,aggregation_function = "mean")
+```
+
+## Résultats sur le modèle{.smaller}
+
+
+
+::: {.column width="50%"}
+
+```{r}
+qda_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+  qda_fit_train <- qda_fit |> extract_workflow() |> fit(data_train)
+  
+  
+  qda_train_predi <- qda_fit_train |> predict(data_train)
+  
+  qda_train_predi$Level <- data_train$Level
+  
+  qda_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+---
+
+## Courbe ROC
+
+```{r}
+qda_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+
+## Matrice de confusion
+
+```{r}
+qda_fit |> matconf()
+```
+# LDA
+
+## Résultats du modèle{.smaller}
+
+::: {.column width="50%"}
+
+```{r}
+load("modèle/fit/lda_fit.RData")
+lda_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+  lda_fit_train <- lda_fit |> extract_workflow() |> fit(data_train)
+  
+  
+  lda_train_predi <- lda_fit_train |> predict(data_train)
+  
+  lda_train_predi$Level <- data_train$Level
+  
+  lda_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+## Courbe ROC
+
+```{r}
+lda_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+## Matrice de confusion
+
+```{r}
+lda_fit |> matconf()
+
+```
+
+
+# k-NN
+
+## Optimisation des hyperparamètres{.center}
+
+```{r}
+load("modèle/tune/knn_tune.RData")
+load("modèle/fit/knn_fit.RData")
+knn_tune |> autoplot()
+```
+
+
+```{r}
+knn_best <- knn_tune |> select_best(metric = "recall") 
+
+knn_best[,1] |>  kableset()
+```
+
+
+## Résultats du modèle{.smaller}
+
+::: {.column width="50%"}
+
+```{r}
+knn_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+  knn_fit_train <- knn_fit |> extract_workflow() |> fit(data_train)
+  
+  
+  knn_train_predi <- knn_fit_train |> predict(data_train)
+  
+  knn_train_predi$Level <- data_train$Level
+  
+  knn_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+## Courbe ROC
+
+```{r}
+knn_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+## Matrice de confusion
+
+```{r}
+knn_fit |> matconf()
+```
+
+# Naive Bayes
+
+## Optimisation des hyperparamètres{.center}
+
+```{r}
+load("modèle/tune/bn_tune.RData")
+
+bn_tune |> autoplot()
+```
+
+```{r}
+bn_best <- bn_tune |> select_best(metric = "recall") 
+
+bn_best[,1] |>  kableset()
+```
+
+## Résultats du modèle{.smaller}
+
+::: {.column width="50%"}
+
+```{r}
+load("modèle/fit/bn_fit.RData")
+bn_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+  bn_fit_train <- bn_fit |> extract_workflow() |> fit(data_train)
+  
+  
+  bn_train_predi <- bn_fit_train |> predict(data_train)
+  
+  bn_train_predi$Level <- data_train$Level
+  
+  bn_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+## Courbe ROC
+
+```{r}
+bn_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+## Matrice de confusion
+
+```{r}
+bn_fit |> matconf()
+```
+# SVM Linear
+
+## Optimisation des hyperparamètres{.center}
+
+```{r}
+load("modèle/tune/svml_tune.RData")
+
+svml_tune |> autoplot()
+```
+
+```{r}
+svml_best <- svml_tune |> select_best(metric = "recall") 
+
+svml_best[,1] |>  kableset()
+```
+
+## Résultats du modèle{.smaller}
+
+::: {.column width="50%"}
+
+```{r}
+load("modèle/fit/svml_fit.RData")
+svml_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+#| include: false
+svml_fit_train <- svml_fit |> extract_workflow() |> fit(data_train)
+```
+
+```{r}
+  svml_train_predi <- svml_fit_train |> predict(data_train)
+  
+  svml_train_predi$Level <- data_train$Level
+  
+  svml_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+## Courbe ROC
+
+```{r}
+svml_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+## Matrice de confusion
+
+```{r}
+svml_fit |> matconf()
+
+```
+
+# SVM Radial
+
+## Optimisation des hyperparamètres{.center}
+
+```{r}
+load("modèle/tune/svmr_tune.RData")
+
+svmr_tune |> autoplot()
+```
+
+```{r}
+svmr_best <- svmr_tune |> select_best(metric = "recall") 
+
+svmr_best[,1:2] |>  kableset()
+```
+
+## Résultats du modèle{.smaller}
+
+::: {.column width="50%"}
+
+```{r}
+load("modèle/fit/svmr_fit.RData")
+svmr_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+#| include: false
+svmr_fit_train <- svmr_fit |> extract_workflow() |> fit(data_train)
+```
+
+```{r}
+  svmr_train_predi <- svmr_fit_train |> predict(data_train)
+  
+  svmr_train_predi$Level <- data_train$Level
+  
+  svmr_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+## Courbe ROC
+
+```{r}
+svmr_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+## Matrice de confusion
+
+```{r}
+svmr_fit |> matconf()
+
+```
+
+# Decision tree
+
+## Optimisation des hyperparamètres{.center}
+
+```{r}
+load("modèle/tune/tree_tune.RData")
+
+tree_tune |> autoplot()
+```
+
+```{r}
+tree_best <- tree_tune |> select_best(metric = "recall") 
+
+tree_best[,1:2] |>  kableset()
+```
+
+## Résultats du modèle{.smaller}
+
+::: {.column width="50%"}
+
+```{r}
+load("modèle/fit/tree_fit.RData")
+tree_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+#| include: false
+tree_fit_train <- tree_fit |> extract_workflow() |> fit(data_train)
+```
+
+```{r}
+  tree_train_predi <- tree_fit_train |> predict(data_train)
+  
+  tree_train_predi$Level <- data_train$Level
+  
+  tree_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+## Courbe ROC
+
+```{r}
+tree_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+## Matrice de confusion
+
+```{r}
+tree_fit |> matconf()
+
+```
+
+
+## Arbre
+
+```{r}
+tree_fit |> 
+  extract_fit_engine() |> 
+  rpart.plot::prp(type = 0, extra = 1, split.box.col = "lightblue",
+                  roundint = FALSE)
+```
+## Importance des variables
+```{r}
+#| message: false
+
+final_model <-  tree_fit |> extract_workflow() |> fit(data)
+
+varimportance <- final_model |> pull_workflow_fit()
+
+vardf <- data.frame(
+  Variable = names(varimportance$fit$variable.importance),
+  Importance = varimportance$fit$variable.importance
+)
+
+
+ggplot(vardf, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "lightblue") +
+  coord_flip() +
+  labs(title = "Importance des Variables", x = "Variables", y = "Importance") +
+  theme_minimal()
+```
+
+
+# Random Forest
+
+## Optimisation des hyperparamètres{.center}
+
+```{r}
+load("modèle/tune/rf_tune.RData")
+
+rf_tune_tbl <- rf_tune |> collect_metrics()
+
+ggplot(rf_tune_tbl, aes(x = mtry, y = mean, color = as.factor(min_n), group = min_n)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ tree_depth) + 
+  labs(
+    title = "Performance en fonction de mtry et min_n pour chaque tree_depth",
+    x = "mtry",
+    y = "Recall (moyenne)",
+    color = "min_n"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+rf_best <- rf_tune |> select_best(metric = "recall") 
+
+rf_best[,1:3] |>  kableset()
+```
+
+## Résultats du modèle{.smaller}
+
+::: {.column width="50%"}
+
+```{r}
+load("modèle/fit/rf_fit.RData")
+rf_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+#| include: false
+rf_fit_train <- rf_fit |> extract_workflow() |> fit(data_train)
+```
+
+```{r}
+  rf_train_predi <- rf_fit_train |> predict(data_train)
+  
+  rf_train_predi$Level <- data_train$Level
+  
+  rf_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+## Courbe ROC
+
+```{r}
+rf_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+
+## Matrice de confusion
+
+```{r}
+rf_fit |> matconf()
+```
+
+
+## Importance des variables
+```{r}
+#| message: false
+
+final_rf_model <-  rf_fit |> extract_workflow() |> fit(data)
+
+varimportance <- final_rf_model$fit$fit$fit$importance
+
+varrfdf <- data.frame(
+  Variable = rownames(varimportance),
+  Importance = varimportance[, 5]
+)
+
+ggplot(varrfdf, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "lightblue") +
+  coord_flip() +
+  labs(title = "Importance des Variables", x = "Variables", y = "Importance") +
+  theme_minimal()
+```
+
+# Boosting
+
+## Optimisation des hyperparamètres{.center}
+
+```{r}
+load("modèle/tune/boost_tune.RData")
+
+boost_tune |> autoplot()
+```
+
+```{r}
+boost_best <- boost_tune |> select_best(metric = "accuracy") 
+
+boost_best[,1:3] |>  kableset()
+```
+
+## Résultats du modèle{.smaller}
+
+::: {.column width="50%"}
+
+```{r}
+load("modèle/fit/boost_fit.RData")
+boost_fit |> tab_res("macro") |> kableset() |> add_header_above(c("Test"=3))
+```
+
+:::
+
+::: {.column width="50%"}
+```{r}
+#| include: false
+boost_fit_train <- boost_fit |> extract_workflow() |> fit(data_train)
+```
+
+```{r}
+  boost_train_predi <- boost_fit_train |> predict(data_train)
+  
+  boost_train_predi$Level <- data_train$Level
+  
+  boost_train_predi |> tab_res_train("macro") |> kableset() |> add_header_above(c("Train"=3))
+```
+:::
+
+## Courbe ROC
+
+```{r}
+boost_fit |> collect_predictions() |> roc_curve(Level,.pred_High,.pred_Low,.pred_Medium) |> autoplot() + theme(panel.grid = element_blank())
+```
+## Matrice de confusion
+
+```{r}
+boost_fit |> matconf()
+
+```
+
+
+## Importance des variables
+```{r}
+#| include: false
+
+vbvarimportance <- extract_fit_parsnip(boost_fit$.workflow[[1]])
+
+
+importance_boosting <- xgboost::xgb.importance(model = vbvarimportance$fit)
+```
+
+```{r}
+vip(vbvarimportance)
+```
+
+
+# Meilleur modèle
+
+```{r}
+model_results <- bind_rows(
+  bn_fit   |> tab_res("macro") |> mutate(model = "Naïve Bayes"),
+  boost_fit |> tab_res("macro") |> mutate(model = "Boosting"),
+  knn_fit  |> tab_res("macro") |> mutate(model = "KNN"),
+  lda_fit  |> tab_res("macro") |> mutate(model = "LDA"),
+  qda_fit  |> tab_res("macro") |> mutate(model = "QDA"),
+  rf_fit   |> tab_res("macro") |> mutate(model = "Random Forest"),
+  svml_fit |> tab_res("macro") |> mutate(model = "SVM Linéaire"),
+  svmr_fit |> tab_res("macro") |> mutate(model = "SVM RBF"),
+  tree_fit |> tab_res("macro") |> mutate(model = "Arbre de Décision")
+)
+
+ggplot(model_results |> filter(.metric %in% c("precision","recall", "roc_auc")), 
+       aes(x = fct_reorder(model, .estimate), y = .estimate, fill = .metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Comparaison des modèles",
+       x = "Modèle",
+       y = "Score de performance",
+       fill = "Métrique") +
+  theme_minimal() +
+  coord_flip()
+```
+
+# Merci de votre attention.

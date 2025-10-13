@@ -1,0 +1,498 @@
+---
+title: "projet s2"
+format: html
+---
+
+# Library
+
+```{r}
+#| warning: false
+#| message: false
+library(tidyverse)
+library(tidymodels)
+library(tidy.outliers)
+library(readr)
+library(ggplot2)
+library(discrim)
+library(kknn)
+library(doParallel)
+library(themis)
+```
+
+# Importation des données
+
+```{r}
+data <- read.table("data/cancer.csv",
+                   header = T,
+                   sep = ",",
+                   stringsAsFactors = T
+                   )[-c(1,2)]
+
+
+data <- data %>%
+  mutate(across(everything(), as.factor))
+
+data$Age <- data$Age |> as.numeric()
+
+
+```
+
+# Etudes stats
+
+```{r}
+data |> summary()
+```
+
+# graphique distribution
+
+## Variable quali
+
+```{r}
+
+# Married.Single
+data |> 
+   ggplot(aes(x = Chest.Pain, fill = as.factor(Level))) + 
+   geom_bar(position = "fill") +
+   theme_minimal()
+
+
+  
+```
+
+## Variable quanti
+
+```{r}
+# Age
+
+data |> 
+   ggplot(aes(x = Level, y = Age)) + 
+   geom_boxplot() +
+   theme_minimal()
+
+```
+
+# Basic tree
+
+## Séparation des donneés
+
+```{r}
+split_data <- initial_split(data, prop = 0.75, strata = Level)
+data_train <- training(split_data)
+data_test <- testing(split_data)
+```
+
+## Recette
+
+```{r}
+rec <- recipe(Level ~ ., data = data_train)|> 
+  step_outliers_maha(all_numeric(), -all_outcomes()) |>
+  step_outliers_lookout(all_numeric(),-contains(r"(.outliers)"),-all_outcomes()) |> 
+  step_outliers_remove(contains(r"(.outliers)"),score_dropout = tune("dropout"),aggregation_function = "mean")
+
+tree_spec <- decision_tree() |> 
+  set_engine("rpart") |> 
+  set_mode("classification")
+```
+
+## Workflow + grille tunes
+
+```{r}
+tune_tree_wf <- workflow() |> 
+  add_model(tree_spec |> 
+              set_args(cost_complexity = tune())
+            ) |>
+  add_recipe(rec)
+
+data_cv <- vfold_cv(data_train) 
+
+cost_complexity_grid <- grid_regular(cost_complexity(range = c(-5, -0.1)), 
+                                     levels = 20)
+
+```
+
+## Tunnage
+
+```{r}
+system.time(
+tree_tune_res <- tune_grid(
+  tune_tree_wf,
+  resamples = data_cv,
+  grid = cost_complexity_grid,
+  metrics = metric_set(accuracy)
+)
+)
+```
+
+## Récupération du meilleur modèle
+
+```{r}
+autoplot(tree_tune_res)
+tree_tune_res |> show_best(metric = "accuracy")
+best_cost_complexity <- select_best(tree_tune_res)
+
+final_tune_tree_wf <- tune_tree_wf |> 
+  finalize_workflow(best_cost_complexity)
+```
+
+## Analyse des courbe roc et pr
+
+```{r}
+tree_fit <- final_tune_tree_wf |> last_fit(split_data)
+tree_fit_final <- final_tune_tree_wf |> fit(data=data_train)
+tree_fit_fina_train <- tree_fit_final |> predict(data_train)
+tree_fit_fina_train$Level <- data_train$Level
+
+tree_fit_fina_train |> tab_res_train("macro")
+
+tree_fit |> collect_metrics() 
+tree_fit |> collect_predictions() 
+tree_fit |> collect_predictions() |> roc_curve(Level, .pred_High, .pred_Low, .pred_Medium ) |> autoplot()
+```
+
+```{r}
+
+tree_fit |> collect_predictions() |> pr_curve(Level, .pred_High, .pred_Low, .pred_Medium ) |> autoplot()
+```
+
+## Visualisation de l'arbre
+
+```{r}
+tree_fit |> 
+  extract_fit_engine() |> 
+  rpart.plot::prp(type = 0, extra = 1, split.box.col = "lightblue",
+                  roundint = FALSE)
+```
+
+## modèle final
+
+```{r}
+final_model <-  final_tune_tree_wf |> 
+  fit(data) # données complètes
+
+tree_last_fit <- final_tune_tree_wf |> last_fit(split_data)
+
+```
+
+## Matrice de confusion
+
+```{r}
+tree_last_fit |> collect_predictions() |> conf_mat(Level,.pred_class)
+```
+
+## Importance des variables
+
+```{r}
+varimportance <- final_model |> pull_workflow_fit()
+
+varimportance$fit$variable.importance
+```
+
+# Modèle de discrime linéaire
+
+## Def des modèles
+
+```{r}
+lda_mod <- discrim_linear() |>
+  set_mode("classification") |>
+  set_engine("MASS")
+
+qda_mod <- discrim_quad() |>
+  set_mode("classification") |>
+  set_engine("MASS")
+
+knn_mod <- nearest_neighbor() |>
+  set_mode("classification") |>
+  set_engine("kknn")
+
+svm_linear_mod <- svm_linear() |>
+  set_mode("classification") |>
+  set_engine("kernlab")
+
+svm_radial_mod <- svm_rbf() |>
+  set_mode("classification") |>
+  set_engine("kernlab")
+```
+
+## Recette à appliquer
+
+```{r}
+dat_rec <- data_train |> recipe(Level ~ .)
+```
+
+```{r}
+lda_wk <- workflow() |>
+  add_model(lda_mod) |>
+  add_recipe(dat_rec)
+
+qda_wk <- workflow() |>
+  add_model(qda_mod) |>
+  add_recipe(dat_rec)
+
+knn_wk <- workflow() |>
+  add_model(knn_mod |> set_args(neighbors = tune())) |>
+  add_recipe(rec)
+
+svm_linear_wk <- workflow() |>
+  add_model(svm_linear_mod |> set_args(cost = tune())) |>
+  add_recipe(rec)
+
+svm_radial_wk <- workflow() |>
+  add_model(svm_radial_mod |> set_args(cost = tune(), rbf_sigma = tune())) |>
+  add_recipe(dat_rec)
+```
+
+## Echantionnage pour l'optimisation des paramètres
+
+Validation croisée
+
+```{r}
+dat_folds <- vfold_cv(data_train)
+```
+
+## Grille pour tester les paramètres
+
+```{r}
+knn_grid <- grid_regular(neighbors(),levels = 15)
+
+tune_res_knn <- tune_grid(knn_wk,
+                          resamples = dat_folds,
+                          grid = knn_grid)
+
+autoplot(tune_res_knn)
+```
+
+on sélectionne le meilleur modèle:
+
+```{r}
+knn_best <- tune_res_knn |> select_best(metric = "accuracy")
+```
+
+finalisation du modèle knn
+
+```{r}
+knn_final_wk <- knn_wk |> finalize_workflow(knn_best)
+```
+
+conf mat
+
+```{r}
+knn_final_fit <- knn_final_wk |> last_fit(split = split_data)
+```
+
+```{r}
+knn_final_fit |> collect_predictions() |> conf_mat(truth = Level, estimate = .pred_class)
+```
+
+## Grille pour l'optimisation du svm linear
+
+```{r}
+svm_lin_grid <- grid_regular(cost(), levels = 15)
+
+tune_res_svm_linear <- tune_grid(svm_linear_wk,
+                                 resamples = data_cv,
+                                 grid = svm_lin_grid,
+                                 metric= metric_set(recall))
+autoplot(tune_res_svm_linear)
+```
+
+```{r}
+svm_linear_final_wk <- svm_linear_wk |> finalize_workflow(tune_res_svm_linear |> select_best(metric = "accuracy"))
+```
+
+conf mat
+
+```{r}
+svm_lin_final_fit <- svm_linear_final_wk |> last_fit(split_data)
+
+svm_lin_final_fit |> collect_predictions() |> conf_mat(Level,.pred_class)
+```
+
+## Grille pour le svm radial
+
+```{r}
+svm_rad_grid <- svm_radial_wk |> 
+  extract_parameter_set_dials() |>
+  grid_regular(levels = 5) 
+
+tune_res_svm_rad <- tune_grid(
+  svm_radial_wk,
+  resamples = dat_folds,
+  grid = svm_rad_grid
+)
+
+autoplot(tune_res_svm_rad)
+```
+
+```{r}
+svm_rad_final_wk <- svm_radial_wk |> 
+  finalize_workflow((tune_res_svm_rad |> select_best(metric = "accuracy")))
+```
+
+confmat
+
+```{r}
+svm_rad_final_fit <- svm_linear_final_wk |> last_fit(split_data)
+svm_rad_final_fit |> collect_predictions() |> conf_mat(Level,.pred_class)
+svm_rad_final_fit |> collect_predictions() |> accuracy(Level,.pred_class)
+```
+
+Les paramètres sont optimisés, on peut maintenant faire travailler les modèles sur la base de donnée d'apprentisage, et compararer la qualité des modèles sur les données test.
+
+```{r}
+collect <- function(x) {
+  last_fit(x,split_data) |> collect_predictions()
+}
+
+lda_result <- lda_wk |> collect()
+qda_result <- qda_wk |> collect()
+knn_result <- knn_final_wk |> collect()
+svm_lin_result  <- svm_linear_final_wk |> collect()
+svm_rad_result <- svm_rad_final_wk |> collect()
+```
+
+On va construire un tableau qui contient les résultats pour chaque indivicu de la base de donnée testing en fonction de la methode utilisé
+
+```{r}
+p <- nrow(data_test)
+models <- c(rep("lda",p),
+            rep("qda",p),
+            rep("knn",p),
+            rep("svm_lin",p),
+            rep("svm_rad",p))
+
+result <- rbind(lda_result,qda_result,knn_result,svm_lin_result,svm_rad_result)
+result$models <- models
+result |> group_by(models) |> roc_curve(Level, .pred_High, .pred_Low, .pred_Medium) |>  autoplot()
+```
+
+# Foret alléatoire
+
+## Workflow
+
+```{r}
+random_forest_spec <- rand_forest(mtry = tune()) |> 
+  set_engine("randomForest", importance = TRUE) |>
+  set_mode("classification")
+
+tune_rf_wf <- workflow() |> 
+  add_model(random_forest_spec) |> 
+  add_recipe(rec)
+```
+
+## Tunage
+
+```{r}
+data_cv <- vfold_cv(data_train) 
+
+mtry_grid <- data.frame(mtry = 1:5)
+system.time(
+  rf_tune_res <- tune_grid(
+    tune_rf_wf, # le workflow
+    resamples = data_cv, # les échantillons de validation croisée
+    grid = mtry_grid, # la grille des valeurs à tester
+    metrics = metric_set(accuracy) # la métrique pour choisir la meilleur valeur
+  )
+)
+autoplot(rf_tune_res)
+```
+
+## Récupération du meilleur param
+
+```{r}
+rf_tune_res |> show_best(metric = "accuracy")
+select_best(rf_tune_res)
+select_by_one_std_err(rf_tune_res, metric = "accuracy", trees)
+#
+best_rf_parameters <- select_best(rf_tune_res)
+best_rf_parameters <- tibble(mtry = c(5), trees = c(200), min_n = c(20))
+#
+final_tune_rf_wf <- tune_rf_wf |> 
+  finalize_workflow(best_rf_parameters)
+# construction sur les données d'entrainement complètes
+set.seed(1687)
+train_rf_model <- final_tune_rf_wf |> fit(data = data_train)
+# ou construction sur les données d'entrainement
+# et évaluation sur les données de test en même temps
+rf_fit <- final_tune_rf_wf |> last_fit(split = split_data)
+rf_fit |> collect_metrics()
+rf_fit |> collect_predictions()
+rf_fit |> collect_predictions() |> roc_curve(Level, .pred_High, .pred_Low, .pred_Medium) |> autoplot()
+```
+
+## conf mat
+
+```{r}
+rf_fit |> collect_predictions() |> conf_mat(Level,.pred_class)
+```
+
+# Boosting
+
+## recette
+
+```{r}
+rec_for_boost <- rec |> 
+  step_dummy(all_nominal_predictors())
+```
+
+## modèle
+
+```{r}
+boostB_spec <- boost_tree(trees = tune(), tree_depth = tune(), learn_rate = tune()) |> 
+  set_engine("xgboost") |> 
+  set_mode("classification")
+
+tune_boostB_wf <- workflow() |> 
+  add_model(boostB_spec) |> 
+  add_recipe(rec)
+
+trees()
+tree_depth()
+learn_rate()
+```
+
+## Tunage
+
+```{r}
+n_core <- parallel::detectCores(logical = TRUE)
+registerDoParallel(cores = n_core-7)
+# ? minutes avec 8 coeurs
+system.time(
+  boostB_tune_res <- tune_grid(
+    tune_boostB_wf, 
+    resamples = data_cv, 
+    grid = grid_regular(extract_parameter_set_dials(tune_boostB_wf), levels = c(trees = 5, tree_depth = 10, learn_rate = 3)), 
+    metrics = metric_set(accuracy)
+  )
+)
+#
+stopImplicitCluster()# ferme le cluster
+```
+
+## Autoplot
+
+```{r}
+autoplot(boostB_tune_res)  +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## conclusion
+
+```{r}
+boostB_tune_res |> show_best(metric = "recall")
+
+
+best_parameters_boost <- boostB_tune_res |> select_best(metric= "accuracy")
+final_boost_wf <- tune_boostB_wf |> 
+  finalize_workflow(best_parameters_boost)
+
+boost_fit <- final_boost_wf |> last_fit(split = split_data)
+boost_fit |> collect_metrics()
+boost_fit |> collect_predictions() |> accuracy(truth = Level, estimate = .pred_class)
+boost_fit |> collect_predictions() |> conf_mat(truth = Level, estimate = .pred_class)
+boost_fit |> collect_predictions() |> roc_curve(Level, .pred_High, .pred_Low, .pred_Medium) |> autoplot()
+```
+
+
+
+
