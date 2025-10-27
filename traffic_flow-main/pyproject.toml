@@ -1,0 +1,9 @@
+[project]
+name = "trafficflow"
+version = "0.1.0"
+description = "Calcul du débit horaire maximal de véhicules dans un réseau routier orienté"
+authors = [{name = "Amaury Coutant et Jawad Grib"}]
+dependencies = ["networkx"]
+
+[tool.setuptools.packages.find]
+where = ["."]
